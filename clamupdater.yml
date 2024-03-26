@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create a ClamAV mirror in S3 fronted by Cloudfront
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: "origin access control(OAC) for allowing cloudfront to access S3 bucket"
+        Name: static-hosting-OAC
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - S3Bucket
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Sub "${BucketName}.s3.${AWS::Region}.amazonaws.com"
+            Id: static-hosting
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+        Enabled: "true"
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          TargetOriginId: static-hosting
+          ForwardedValues:
+            QueryString: "false"
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ClamAV-Updater-iam"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ["sts:AssumeRole"]
+            Effect: Allow
+            Principal:
+              Service: [codebuild.amazonaws.com]
+        Version: "2012-10-17"
+      Path: /
+      Policies:
+        - PolicyName: PoliciesCodeBuildAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "logs:*"
+                Effect: Allow
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "codebuild:CreateReportGroup"
+                  - "codebuild:CreateReport"
+                  - "codebuild:UpdateReport"
+                  - "codebuild:BatchPutTestCases"
+                  - "codebuild:BatchPutCodeCoverages"
+                Resource:
+                  - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/ClamAV-Updater*"
+        - PolicyName: "s3"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:Put*"
+                  - "s3:List*"
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ClamAV-Trigger-iam"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ["sts:AssumeRole"]
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com]
+        Version: "2012-10-17"
+      Path: /
+      Policies:
+        - PolicyName: PoliciesCodeBuildAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                  - "codebuild:StartBuild"
+                Effect: Allow
+                Resource: !GetAtt Project.Arn
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+      - CloudFrontDistribution
+      - S3Bucket
+    Properties:
+      Bucket: !Ref BucketName
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+            - 's3:GetObject'
+            Effect: Allow
+            Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+            Principal: "*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn":
+                  - !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+  Project:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: ClamAV-Mirror
+      Description: Update build to push ClamAV database files to S3
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+        - Name: S3_DESTINATION
+          Type: PLAINTEXT
+          Value: !Sub "s3://${BucketName}"
+      Source:
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo Build started on `date`
+                - mkdir /tmp/clam
+                - pip3 install cvdupdate
+                - cvd config set --dbdir /tmp/clam
+                - cvd update
+                - ls -al /tmp/clam
+                - aws s3 sync /tmp/clam ${S3_DESTINATION}
+                - echo Done uploading to S3
+        Type: NO_SOURCE
+      TimeoutInMinutes: 10
+  DailyTrigger:
+    Type: AWS::Events::Rule
+    DependsOn: TriggerRole
+    Properties:
+      Description: "Update ClamAV daily"
+      Name: "ClamAV-Daily-Update"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt Project.Arn
+          Id: ClamAV-Update
+          RoleArn: !GetAtt TriggerRole.Arn
+        
+Outputs:
+  CloudFrontDistributionURL:
+    Description: URL of the CloudFront distribution
+    Value: !GetAtt CloudFrontDistribution.DomainName
