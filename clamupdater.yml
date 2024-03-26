@@ -129,7 +129,8 @@ Resources:
             - 's3:GetObject'
             Effect: Allow
             Resource: !Sub "arn:aws:s3:::${BucketName}/*"
-            Principal: "*"
+            Principal:
+              Service: cloudfront.amazonaws.com
             Condition:
               StringEquals:
                 "AWS:SourceArn":
@@ -138,7 +139,7 @@ Resources:
     Type: AWS::CodeBuild::Project
     Properties:
       Name: ClamAV-Mirror
-      Description: Update build to push ClamAV database files to S3
+      Description: Project to download ClamAV database and upload to S3
       ServiceRole: !GetAtt CodeBuildRole.Arn
       Artifacts:
         Type: no_artifacts
